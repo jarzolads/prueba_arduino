@@ -5,256 +5,263 @@ from datetime import datetime
 import pandas as pd
 import serial
 import streamlit as st
-from serial.tools import list_ports
 
 
 st.set_page_config(
-    page_title="Monitor DHT11",
+    page_title="Monitor DHT11 COM4",
     page_icon="🌡️",
     layout="wide"
 )
 
 
-def init_state():
-    if "serial_conn" not in st.session_state:
-        st.session_state.serial_conn = None
+# ==========================================================
+# CONFIGURACIÓN FIJA
+# ==========================================================
 
-    if "connected" not in st.session_state:
-        st.session_state.connected = False
+PUERTO_DEFAULT = "COM4"
+BAUDIOS_DEFAULT = 9600
 
-    if "running" not in st.session_state:
-        st.session_state.running = False
 
-    if "data" not in st.session_state:
-        st.session_state.data = []
+# ==========================================================
+# FUNCIONES
+# ==========================================================
 
-    if "raw_lines" not in st.session_state:
-        st.session_state.raw_lines = []
+def inicializar_estado():
+    if "datos" not in st.session_state:
+        st.session_state.datos = []
 
-    if "last_error" not in st.session_state:
-        st.session_state.last_error = ""
+    if "lineas_crudas" not in st.session_state:
+        st.session_state.lineas_crudas = []
 
-    if "current_port" not in st.session_state:
-        st.session_state.current_port = ""
+    if "leyendo" not in st.session_state:
+        st.session_state.leyendo = False
 
     if "t0" not in st.session_state:
         st.session_state.t0 = time.time()
 
-
-def list_serial_ports():
-    ports = list_ports.comports()
-    return [p.device for p in ports]
+    if "error" not in st.session_state:
+        st.session_state.error = ""
 
 
-def parse_line(line):
+@st.cache_resource
+def abrir_puerto_serial(puerto, baudios):
     """
-    Acepta líneas como:
+    Abre el puerto serial y mantiene la conexión entre reruns de Streamlit.
+    Esto evita que Streamlit pierda el objeto serial cada vez que actualiza la página.
+    """
+    arduino = serial.Serial(
+        port=puerto,
+        baudrate=baudios,
+        timeout=2
+    )
+
+    # Arduino se reinicia al abrir el puerto
+    time.sleep(2)
+
+    arduino.reset_input_buffer()
+
+    return arduino
+
+
+def cerrar_puerto_serial():
+    """
+    Cierra el puerto serial y limpia el recurso cacheado.
+    """
+    try:
+        arduino = abrir_puerto_serial(PUERTO_DEFAULT, BAUDIOS_DEFAULT)
+        if arduino.is_open:
+            arduino.close()
+    except Exception:
+        pass
+
+    abrir_puerto_serial.clear()
+
+
+def convertir_float(texto):
+    return float(texto.replace(",", "."))
+
+
+def interpretar_linea(linea):
+    """
+    Acepta formatos como:
+
     Temperatura:25.00    Humedad:60.00
     Humedad:60.00        Temperatura:25.00
     25.00,60.00
+    25.00 60.00
+
+    Regresa:
+    temperatura, humedad
     """
 
-    clean = line.strip()
+    linea = linea.strip()
 
-    if not clean:
+    if not linea:
         return None
 
-    number = r"[-+]?\d+(?:[\.,]\d+)?"
+    numero = r"[-+]?\d+(?:[\.,]\d+)?"
 
     temp_match = re.search(
-        rf"(?:temperatura|temperature|temp)\s*[:=]\s*({number})",
-        clean,
+        rf"(?:temperatura|temperature|temp)\s*[:=]\s*({numero})",
+        linea,
         re.IGNORECASE
     )
 
     hum_match = re.search(
-        rf"(?:humedad|humidity|hum)\s*[:=]\s*({number})",
-        clean,
+        rf"(?:humedad|humidity|hum)\s*[:=]\s*({numero})",
+        linea,
         re.IGNORECASE
     )
 
     if temp_match and hum_match:
-        temperatura = float(temp_match.group(1).replace(",", "."))
-        humedad = float(hum_match.group(1).replace(",", "."))
+        temperatura = convertir_float(temp_match.group(1))
+        humedad = convertir_float(hum_match.group(1))
         return temperatura, humedad
 
-    values = re.findall(number, clean)
+    valores = re.findall(numero, linea)
 
-    if len(values) >= 2:
-        temperatura = float(values[0].replace(",", "."))
-        humedad = float(values[1].replace(",", "."))
+    if len(valores) >= 2:
+        temperatura = convertir_float(valores[0])
+        humedad = convertir_float(valores[1])
         return temperatura, humedad
 
     return None
 
 
-def connect_serial(port, baudrate):
-    try:
-        if st.session_state.serial_conn is not None:
-            try:
-                st.session_state.serial_conn.close()
-            except Exception:
-                pass
-
-        arduino = serial.Serial(
-            port=port,
-            baudrate=baudrate,
-            timeout=2
-        )
-
-        time.sleep(2)
-        arduino.reset_input_buffer()
-
-        st.session_state.serial_conn = arduino
-        st.session_state.connected = True
-        st.session_state.running = True
-        st.session_state.current_port = port
-        st.session_state.last_error = ""
-        st.session_state.t0 = time.time()
-
-    except Exception as e:
-        st.session_state.connected = False
-        st.session_state.running = False
-        st.session_state.serial_conn = None
-        st.session_state.last_error = str(e)
-
-
-def disconnect_serial():
-    try:
-        if st.session_state.serial_conn is not None:
-            st.session_state.serial_conn.close()
-    except Exception:
-        pass
-
-    st.session_state.serial_conn = None
-    st.session_state.connected = False
-    st.session_state.running = False
-
-
-def read_one_line():
-    arduino = st.session_state.serial_conn
-
-    if arduino is None:
-        return
+def leer_dato_serial(puerto, baudios):
+    """
+    Lee una línea desde Arduino.
+    """
 
     try:
-        line = arduino.readline().decode("utf-8", errors="ignore").strip()
+        arduino = abrir_puerto_serial(puerto, baudios)
 
-        if line:
-            st.session_state.raw_lines.append(line)
-            st.session_state.raw_lines = st.session_state.raw_lines[-20:]
+        if not arduino.is_open:
+            st.session_state.error = "El puerto serial está cerrado."
+            return
 
-            parsed = parse_line(line)
+        linea = arduino.readline().decode("utf-8", errors="ignore").strip()
 
-            if parsed is not None:
-                temperatura, humedad = parsed
-                elapsed = time.time() - st.session_state.t0
+        if linea:
+            st.session_state.lineas_crudas.append(linea)
+            st.session_state.lineas_crudas = st.session_state.lineas_crudas[-20:]
 
-                st.session_state.data.append({
+            datos = interpretar_linea(linea)
+
+            if datos is not None:
+                temperatura, humedad = datos
+                tiempo_s = time.time() - st.session_state.t0
+
+                st.session_state.datos.append({
                     "fecha_hora": datetime.now(),
-                    "tiempo_s": round(elapsed, 2),
+                    "tiempo_s": round(tiempo_s, 2),
                     "temperatura_C": round(temperatura, 2),
                     "humedad_pct": round(humedad, 2),
-                    "linea_serial": line
+                    "linea_serial": linea
                 })
 
-                st.session_state.data = st.session_state.data[-500:]
+                st.session_state.datos = st.session_state.datos[-500:]
+
+        st.session_state.error = ""
+
+    except serial.SerialException as e:
+        st.session_state.error = (
+            f"No se pudo leer el puerto {puerto}. "
+            f"Detalle: {e}"
+        )
 
     except Exception as e:
-        st.session_state.last_error = str(e)
-        disconnect_serial()
+        st.session_state.error = f"Error inesperado: {e}"
 
 
-init_state()
+# ==========================================================
+# APP
+# ==========================================================
 
-st.title("🌡️ Monitor DHT11 con Arduino")
-st.caption("Lectura en tiempo real de temperatura y humedad por puerto serial.")
+inicializar_estado()
+
+st.title("🌡️ Monitor DHT11 con Arduino por COM4")
+st.caption("Versión simplificada para leer directamente el puerto serial sin detección automática.")
 
 with st.sidebar:
-    st.header("⚙️ Configuración")
+    st.header("⚙️ Configuración serial")
 
-    detected_ports = list_serial_ports()
-
-    if detected_ports:
-        st.write("Puertos detectados:")
-        for p in detected_ports:
-            st.code(p)
-    else:
-        st.warning("No se detectaron puertos seriales.")
-
-    port = st.text_input("Puerto serial", value="COM4")
-
-    baudrate = st.selectbox(
-        "Baudios",
-        [9600, 19200, 38400, 57600, 115200],
-        index=0
-    )
-
-    if st.button("Conectar", disabled=st.session_state.connected):
-        connect_serial(port, baudrate)
-        st.rerun()
-
-    if st.button("Desconectar", disabled=not st.session_state.connected):
-        disconnect_serial()
-        st.rerun()
-
-    if st.button("Limpiar datos"):
-        st.session_state.data = []
-        st.session_state.raw_lines = []
-        st.session_state.t0 = time.time()
-        st.rerun()
+    puerto = st.text_input("Puerto serial", value=PUERTO_DEFAULT)
+    baudios = st.number_input("Baudios", value=BAUDIOS_DEFAULT, step=1)
 
     st.divider()
 
-    if st.session_state.connected:
-        st.success(f"Conectado a {st.session_state.current_port}")
+    if st.button("Conectar / iniciar lectura", use_container_width=True):
+        st.session_state.leyendo = True
+        st.session_state.error = ""
+
+        try:
+            abrir_puerto_serial(puerto, baudios)
+            st.success(f"Conectado a {puerto}")
+        except Exception as e:
+            st.session_state.leyendo = False
+            st.session_state.error = f"No se pudo abrir {puerto}: {e}"
+
+    if st.button("Detener lectura", use_container_width=True):
+        st.session_state.leyendo = False
+
+    if st.button("Cerrar puerto", use_container_width=True):
+        st.session_state.leyendo = False
+        cerrar_puerto_serial()
+        st.success("Puerto cerrado.")
+
+    if st.button("Limpiar datos", use_container_width=True):
+        st.session_state.datos = []
+        st.session_state.lineas_crudas = []
+        st.session_state.t0 = time.time()
+
+    st.divider()
+
+    if st.session_state.leyendo:
+        st.success("Estado: leyendo")
     else:
-        st.info("Sin conexión")
-
-    if st.session_state.running:
-        st.write("Estado: 🟢 Leyendo")
-    else:
-        st.write("Estado: 🔴 Detenido")
+        st.info("Estado: detenido")
 
 
-if st.session_state.last_error:
-    st.error(st.session_state.last_error)
+if st.session_state.error:
+    st.error(st.session_state.error)
 
-if st.session_state.connected and st.session_state.running:
-    read_one_line()
+
+if st.session_state.leyendo:
+    leer_dato_serial(puerto, baudios)
 
 
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    st.metric("Puerto", st.session_state.current_port if st.session_state.current_port else "Ninguno")
+    st.metric("Puerto", puerto)
 
 with col2:
-    st.metric("Conexión", "Activa" if st.session_state.connected else "Inactiva")
+    st.metric("Baudios", baudios)
 
 with col3:
-    st.metric("Lecturas válidas", len(st.session_state.data))
+    st.metric("Lecturas válidas", len(st.session_state.datos))
 
 
-df = pd.DataFrame(st.session_state.data)
+df = pd.DataFrame(st.session_state.datos)
 
 if df.empty:
-    st.warning("Todavía no hay datos válidos.")
+    st.warning("Todavía no hay lecturas válidas.")
 else:
-    last = df.iloc[-1]
+    ultima = df.iloc[-1]
 
     m1, m2 = st.columns(2)
 
     with m1:
-        st.metric("Temperatura", f"{last['temperatura_C']:.2f} °C")
+        st.metric("Temperatura", f"{ultima['temperatura_C']:.2f} °C")
 
     with m2:
-        st.metric("Humedad", f"{last['humedad_pct']:.2f} %")
+        st.metric("Humedad", f"{ultima['humedad_pct']:.2f} %")
 
     st.subheader("📈 Gráfica en tiempo real")
 
-    chart_df = df.set_index("tiempo_s")[["temperatura_C", "humedad_pct"]]
-    st.line_chart(chart_df)
+    grafica = df.set_index("tiempo_s")[["temperatura_C", "humedad_pct"]]
+    st.line_chart(grafica)
 
     with st.expander("Tabla de datos"):
         st.dataframe(df, use_container_width=True, hide_index=True)
@@ -271,10 +278,10 @@ else:
 
 st.subheader("Líneas crudas recibidas desde Arduino")
 
-if st.session_state.raw_lines:
-    st.code("\n".join(st.session_state.raw_lines), language="text")
+if st.session_state.lineas_crudas:
+    st.code("\n".join(st.session_state.lineas_crudas), language="text")
 else:
-    st.info("No se han recibido líneas desde Arduino.")
+    st.info("Aún no se han recibido líneas crudas.")
 
 
 st.divider()
@@ -292,12 +299,13 @@ Serial.println(humedad);
     language="cpp"
 )
 
+
 st.info(
-    "Cierra el Monitor Serial y el Serial Plotter antes de conectar desde Streamlit. "
-    "El puerto COM no puede ser usado por dos programas al mismo tiempo."
+    "Cierra completamente el Monitor Serial y el Serial Plotter antes de iniciar la lectura en Streamlit."
 )
 
 
-if st.session_state.connected and st.session_state.running:
+# Actualización automática
+if st.session_state.leyendo:
     time.sleep(1)
     st.rerun()
